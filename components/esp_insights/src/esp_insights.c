@@ -55,6 +55,8 @@
 #define INSIGHTS_DATA_MAX_SIZE  CONFIG_RTC_STORE_DATA_SIZE
 #endif
 
+#define INSIGHTS_READ_BUF_SIZE  (1024)  // read this much data from data store in one go
+
 #define SEND_INSIGHTS_META (CONFIG_DIAG_ENABLE_METRICS || CONFIG_DIAG_ENABLE_VARIABLES)
 #define KEY_LOG_WR_FAIL    "log_wr_fail"
 
@@ -71,6 +73,7 @@ typedef struct esp_insights_entry {
 
 typedef struct {
     uint8_t *scratch_buf;
+    uint8_t *read_buf;      // buffer to hold data read from RTC buf
     int data_msg_id;
     uint32_t data_msg_len;
     SemaphoreHandle_t data_lock;
@@ -86,7 +89,8 @@ typedef struct {
     TimerHandle_t data_send_timer; /* timer to reset data_send_inprogress flag on timeout */
     char *node_id;
     int boot_msg_id;   /* To track whether first message is sent or not, -1:failed, 0:success, >0:inprogress */
-    bool init_done;
+    bool init_done;     /* insights init done */
+    bool enabled;       /* insights enable is done */
 } esp_insights_data_t;
 
 #ifdef CONFIG_ESP_INSIGHTS_ENABLED
@@ -112,7 +116,7 @@ static bool is_insights_active(void)
 {
     wifi_ap_record_t ap_info;
     bool wifi_connected = esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK;
-    return wifi_connected && s_insights_data.data_lock;
+    return wifi_connected && s_insights_data.enabled;
 }
 
 /* This executes in the context of timer task.
@@ -181,17 +185,19 @@ static esp_err_t esp_insights_register_periodic_handler(esp_rmaker_work_fn_t wor
                                                         void *priv_data)
 {
     if (s_periodic_insights_entry) {
-        ESP_LOGD(TAG, "s_periodic_insights_entry already registered");
+        ESP_LOGI(TAG, "s_periodic_insights_entry already registered");
         return ESP_OK;
     }
 
     if (!work_fn || (min_seconds == 0) || (max_seconds == 0)) {
-        return ESP_FAIL;
+        ESP_LOGI(TAG, "invalid params register_periodic_handler");
+        return ESP_ERR_INVALID_ARG;
     }
 
     s_periodic_insights_entry = calloc (1, sizeof(esp_insights_entry_t));
     if (!s_periodic_insights_entry) {
-        return ESP_FAIL;
+        ESP_LOGI(TAG, "allocation failed, line %d", __LINE__);
+        return ESP_ERR_NO_MEM;
     }
     s_periodic_insights_entry->work_fn = work_fn;
     s_periodic_insights_entry->priv_data = priv_data;
@@ -201,6 +207,7 @@ static esp_err_t esp_insights_register_periodic_handler(esp_rmaker_work_fn_t wor
     s_periodic_insights_entry->timer = xTimerCreate("test", (s_periodic_insights_entry->cur_seconds * 1000)/ portTICK_PERIOD_MS,
                                                     pdFALSE, (void *)s_periodic_insights_entry, esp_insights_common_cb);
     if (!s_periodic_insights_entry->timer) {
+        ESP_LOGI(TAG, "timer creation failed, line %d", __LINE__);
         free(s_periodic_insights_entry);
         return ESP_FAIL;
     }
@@ -208,7 +215,11 @@ static esp_err_t esp_insights_register_periodic_handler(esp_rmaker_work_fn_t wor
      * esp_insights_first_call() will be executed after MQTT connection is established.
      * It add the work_fn to the queue and start the periodic timer.
      */
-    return esp_rmaker_work_queue_add_task(esp_insights_first_call, s_periodic_insights_entry);
+    esp_err_t ret = esp_rmaker_work_queue_add_task(esp_insights_first_call, s_periodic_insights_entry);
+    if (ret != ESP_OK) {
+        ESP_LOGI(TAG, "failed to enqueue insights_first_call, line %d", __LINE__);
+    }
+    return ret;
 }
 
 static void data_send_timeout_cb(TimerHandle_t handle)
@@ -243,18 +254,17 @@ static void insights_event_handler(void* arg, esp_event_base_t event_base,
                     rtc_store_critical_data_release(s_insights_data.data_msg_len);
                     s_insights_data.data_sent = true;
                     s_insights_data.data_send_inprogress = false;
-                    if (s_insights_data.boot_msg_id > 0 && s_insights_data.boot_msg_id == data->msg_id) {
-#if CONFIG_ESP_INSIGHTS_COREDUMP_ENABLE
-                        esp_core_dump_image_erase();
-#endif // CONFIG_ESP_INSIGHTS_COREDUMP_ENABLE
-                        s_insights_data.boot_msg_id = 0;
-                    }
 #if SEND_INSIGHTS_META
                 } else if (s_insights_data.meta_msg_pending && data->msg_id == s_insights_data.meta_msg_id) {
                     esp_insights_meta_nvs_crc_set(s_insights_data.meta_crc);
                     s_insights_data.meta_msg_pending = false;
                     s_insights_data.data_sent = true;
 #endif /* SEND_INSIGHTS_META */
+                } else if (s_insights_data.boot_msg_id > 0 && s_insights_data.boot_msg_id == data->msg_id) {
+#if CONFIG_ESP_INSIGHTS_COREDUMP_ENABLE
+                    esp_core_dump_image_erase();
+#endif // CONFIG_ESP_INSIGHTS_COREDUMP_ENABLE
+                    s_insights_data.boot_msg_id = 0;
                 }
                 xSemaphoreGive(s_insights_data.data_lock);
             }
@@ -288,6 +298,35 @@ static void hex_dump(uint8_t *data, uint32_t len)
     printf("\n");
 }
 #endif /* INSIGHTS_DEBUG_ENABLED */
+
+static void send_boottime_data(void)
+{
+    uint16_t len = 0;
+    esp_insights_encode_data_begin(s_insights_data.scratch_buf, INSIGHTS_DATA_MAX_SIZE);
+    esp_insights_encode_boottime_data();
+    len = esp_insights_encode_data_end(s_insights_data.scratch_buf);
+    if (len == 0) {
+        ESP_LOGE(TAG, "No boottime data to send");
+        s_insights_data.boot_msg_id = 0; // mark it sent
+    }
+#if INSIGHTS_DEBUG_ENABLED
+    ESP_LOGI(TAG, "Sending boottime data of length: %d", len);
+    hex_dump(s_insights_data.scratch_buf, len);
+#endif
+    int msg_id = esp_insights_transport_data_send(s_insights_data.scratch_buf, len);
+    s_insights_data.boot_msg_id = msg_id;
+    if (msg_id > 0) {
+        return;
+    } else if (msg_id == 0) {
+#if CONFIG_ESP_INSIGHTS_COREDUMP_ENABLE
+        esp_core_dump_image_erase();
+#endif // CONFIG_ESP_INSIGHTS_COREDUMP_ENABLE
+    } else {
+#if INSIGHTS_DEBUG_ENABLED
+        ESP_LOGI(TAG, "boottime_data message send failed");
+#endif
+    }
+}
 
 #if SEND_INSIGHTS_META
 /* Returns true if ESP Insights metadata CRC is changed */
@@ -329,6 +368,10 @@ static void send_insights_meta(void)
         xSemaphoreGive(s_insights_data.data_lock);
     } else if (msg_id == 0) {
         esp_insights_meta_nvs_crc_set(s_insights_data.meta_crc);
+    } else {
+#if INSIGHTS_DEBUG_ENABLED
+        ESP_LOGI(TAG, "meta message send failed");
+#endif
     }
 }
 #endif /* SEND_INSIGHTS_META */
@@ -346,10 +389,10 @@ static void send_insights_meta(void)
 static void send_insights_data(void)
 {
     uint16_t len = 0;
-    const void *critical_data = NULL;
-    const void *non_critical_data = NULL;
     size_t critical_data_size = 0;
     size_t non_critical_data_size = 0;
+    size_t critical_consumed = 0;
+    size_t non_critical_consumed = 0;
 
     memset(s_insights_data.scratch_buf, 0, INSIGHTS_DATA_MAX_SIZE);
 
@@ -361,48 +404,21 @@ static void send_insights_data(void)
     }
 #endif /* CONFIG_DIAG_ENABLE_VARIABLES */
 
-    // If encoding first message
-    if (s_insights_data.boot_msg_id == -1) {
-        esp_insights_encode_data_begin(s_insights_data.scratch_buf, INSIGHTS_DATA_MAX_SIZE, s_insights_data.app_sha256);
+    esp_insights_encode_data_begin(s_insights_data.scratch_buf, INSIGHTS_DATA_MAX_SIZE);
 
-        /* If any ESP_LOGE, ESP_LOGW is added in between rtc_store_critical_data_read_and_lock()
-         * and rtc_store_critical_data_release_and_unlock(), system will be deadlocked.
-         * So, encode boottime data before acquiring the data store lock,
-         * Becuase, esp_insights_encode_boottime_data() calls esp_core_dump_image_check() which contain few error logs
-         */
-        esp_insights_encode_boottime_data();
+    critical_data_size = rtc_store_critical_data_read(s_insights_data.read_buf, INSIGHTS_READ_BUF_SIZE);
+    if (critical_data_size > 0) {
+        critical_consumed = esp_insights_encode_critical_data(s_insights_data.read_buf, critical_data_size);
+    }
 
-        critical_data = rtc_store_critical_data_read_and_lock(&critical_data_size);
-        if (critical_data) {
-            esp_insights_encode_critical_data(critical_data, critical_data_size);
-            rtc_store_critical_data_release_and_unlock(0);
-        }
-
-        non_critical_data = rtc_store_non_critical_data_read_and_lock(&non_critical_data_size);
-        if (non_critical_data) {
-            esp_insights_encode_non_critical_data(non_critical_data, non_critical_data_size);
-            /* Remove all the non critical data after encoding */
-            rtc_store_non_critical_data_release_and_unlock(non_critical_data_size);
-        }
-        len = esp_insights_encode_data_end(s_insights_data.scratch_buf);
-    } else {
-        critical_data = rtc_store_critical_data_read_and_lock(&critical_data_size);
-        non_critical_data = rtc_store_non_critical_data_read_and_lock(&non_critical_data_size);
-
-        if (critical_data || non_critical_data) {
-            esp_insights_encode_data_begin(s_insights_data.scratch_buf, INSIGHTS_DATA_MAX_SIZE, s_insights_data.app_sha256);
-        }
-        if (critical_data) {
-            esp_insights_encode_critical_data(critical_data, critical_data_size);
-            rtc_store_critical_data_release_and_unlock(0);
-        }
-        if (non_critical_data) {
-            esp_insights_encode_non_critical_data(non_critical_data, non_critical_data_size);
-            rtc_store_non_critical_data_release_and_unlock(non_critical_data_size);
-        }
-        if (critical_data || non_critical_data) {
-            len = esp_insights_encode_data_end(s_insights_data.scratch_buf);
-        }
+    non_critical_data_size = rtc_store_non_critical_data_read(s_insights_data.read_buf, INSIGHTS_READ_BUF_SIZE);
+    if (non_critical_data_size > 0) {
+        non_critical_consumed = esp_insights_encode_non_critical_data(s_insights_data.read_buf, non_critical_data_size);
+        rtc_store_non_critical_data_release(non_critical_consumed);
+    }
+    len = esp_insights_encode_data_end(s_insights_data.scratch_buf);
+    if (!critical_consumed && !non_critical_consumed) {
+        len = 0; // just ignore the encoded data
     }
 
     if (len == 0) {
@@ -418,23 +434,18 @@ static void send_insights_data(void)
     int msg_id = esp_insights_transport_data_send(s_insights_data.scratch_buf, len);
     if (msg_id > 0) {
         xSemaphoreTake(s_insights_data.data_lock, portMAX_DELAY);
-        s_insights_data.data_msg_len = critical_data_size;
+        s_insights_data.data_msg_len = critical_consumed;
         s_insights_data.data_msg_id = msg_id;
-        if (s_insights_data.boot_msg_id == -1) {
-            s_insights_data.boot_msg_id = msg_id;
-        }
         xTimerReset(s_insights_data.data_send_timer, portMAX_DELAY);
         xSemaphoreGive(s_insights_data.data_lock);
         return;
     } else if (msg_id == 0) {
-        rtc_store_critical_data_release(critical_data_size);
+        rtc_store_critical_data_release(critical_consumed);
         s_insights_data.data_sent = true;
-        if (s_insights_data.boot_msg_id == -1) {
-#if CONFIG_ESP_INSIGHTS_COREDUMP_ENABLE
-            esp_core_dump_image_erase();
-#endif // CONFIG_ESP_INSIGHTS_COREDUMP_ENABLE
-            s_insights_data.boot_msg_id = 0;
-        }
+    } else {
+#if INSIGHTS_DEBUG_ENABLED
+        ESP_LOGI(TAG, "insights_data message send failed");
+#endif
     }
 data_send_end:
     xSemaphoreTake(s_insights_data.data_lock, portMAX_DELAY);
@@ -462,6 +473,9 @@ static void insights_periodic_handler(void *priv_data)
         send_insights_meta();
     }
 #endif /* SEND_INSIGHTS_META */
+    if (s_insights_data.boot_msg_id == -1) {
+        send_boottime_data();
+    }
     send_insights_data();
 }
 
@@ -516,9 +530,11 @@ static void rtc_store_event_handler(void* arg, esp_event_base_t event_base,
 static esp_err_t log_write_cb(void *data, size_t len, void *priv_data)
 {
     esp_err_t ret_val = rtc_store_critical_data_write(data, len);
+#if INSIGHTS_DEBUG_ENABLED
     if (ret_val != ESP_OK) {
-        printf("rtc_store_critical_data_write failed len %d, err 0x%04x\n", len, ret_val);
+        ESP_LOGI(TAG, "rtc_store_critical_data_write failed len %d, err 0x%04x", len, ret_val);
     }
+#endif
     return ret_val;
 }
 
@@ -526,9 +542,11 @@ static esp_err_t log_write_cb(void *data, size_t len, void *priv_data)
 static esp_err_t metrics_write_cb(const char *group, void *data, size_t len, void *cb_arg)
 {
     esp_err_t ret_val = rtc_store_non_critical_data_write(group, data, len);
+#if INSIGHTS_DEBUG_ENABLED
     if (ret_val != ESP_OK) {
-        printf("rtc_store_non_critical_data_write failed group %s, len %d, err 0x%04x\n", group, len, ret_val);
+        ESP_LOGI(TAG, "rtc_store_non_critical_data_write failed group %s, len %d, err 0x%04x", group, len, ret_val);
     }
+#endif
     return ret_val;
 }
 
@@ -608,6 +626,8 @@ static void variables_deinit(void)
 
 void esp_insights_disable(void)
 {
+    s_insights_data.enabled = false;
+
     esp_insights_unregister_periodic_handler();
 #ifdef CONFIG_DIAG_ENABLE_VARIABLES
     variables_deinit();
@@ -707,14 +727,23 @@ esp_err_t esp_insights_enable(esp_insights_config_t *config)
     }
     if (config->alloc_ext_ram) {
         s_insights_data.scratch_buf = MEM_ALLOC_EXTRAM(INSIGHTS_DATA_MAX_SIZE);
+        s_insights_data.read_buf = MEM_ALLOC_EXTRAM(INSIGHTS_READ_BUF_SIZE);
     } else {
         s_insights_data.scratch_buf = malloc(INSIGHTS_DATA_MAX_SIZE);
+        s_insights_data.read_buf = malloc(INSIGHTS_READ_BUF_SIZE);
     }
     if (!s_insights_data.scratch_buf) {
         ESP_LOGE(TAG, "Failed to allocate memory for scratch buffer.");
         err = ESP_ERR_NO_MEM;
         goto enable_err;
     }
+    if (!s_insights_data.read_buf) {
+        ESP_LOGE(TAG, "Failed to allocate memory for read_buf");
+        free(s_insights_data.scratch_buf);
+        err = ESP_ERR_NO_MEM;
+        goto enable_err;
+    }
+
     /* Get sha256 */
     esp_diag_device_info_t device_info;
     memset(&device_info, 0, sizeof(device_info));
@@ -759,12 +788,6 @@ esp_err_t esp_insights_enable(esp_insights_config_t *config)
 #endif /* CONFIG_DIAG_ENABLE_VARIABLES */
 
     s_insights_data.boot_msg_id = -1;
-    err = esp_insights_register_periodic_handler(insights_periodic_handler,
-                CLOUD_REPORTING_PERIOD_MIN_SEC, CLOUD_REPORTING_PERIOD_MAX_SEC, NULL);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to register insights_periodic_handler.");
-        goto enable_err;
-    }
     s_insights_data.data_send_timer = xTimerCreate("data_send_timer", CLOUD_REPORTING_TIMEOUT_TICKS,
                                                    pdFALSE, NULL, data_send_timeout_cb);
     if (!s_insights_data.data_send_timer) {
@@ -772,9 +795,20 @@ esp_err_t esp_insights_enable(esp_insights_config_t *config)
         err = ESP_ERR_NO_MEM;
         goto enable_err;
     }
+
+    err = esp_insights_register_periodic_handler(insights_periodic_handler,
+                CLOUD_REPORTING_PERIOD_MIN_SEC, CLOUD_REPORTING_PERIOD_MAX_SEC, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register insights_periodic_handler.");
+        goto enable_err;
+    }
+
+    s_insights_data.enabled = true;
+
     ESP_LOGI(TAG, "=========================================");
     ESP_LOGI(TAG, "Insights enabled for Node ID %s", s_insights_data.node_id);
     ESP_LOGI(TAG, "=========================================");
+    s_insights_data.init_done = true;
     return ESP_OK;
 enable_err:
     esp_insights_disable();

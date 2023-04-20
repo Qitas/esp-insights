@@ -18,7 +18,7 @@ if(CONFIG_DIAG_ENABLE_VARIABLES)
     endif()
 endif()
 
-set(priv_req freertos app_update)
+set(priv_req freertos app_update rmaker_common)
 
 # esp_hw_support component was introduced in v4.3
 if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER "4.2")
@@ -35,6 +35,11 @@ idf_component_register(SRCS "${srcs}"
                     PRIV_REQUIRES ${priv_req})
 
 set(WRAP_FUNCTIONS esp_log_write esp_log_writev)
+
+if(CONFIG_LIB_BUILDER_COMPILE)
+    list(APPEND WRAP_FUNCTIONS log_printf)
+endif()
+
 foreach(func ${WRAP_FUNCTIONS})
      target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=${func}")
 endforeach()

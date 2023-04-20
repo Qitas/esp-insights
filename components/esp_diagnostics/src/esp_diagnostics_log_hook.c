@@ -343,47 +343,32 @@ static esp_err_t diag_log_add(esp_diag_log_type_t type, uint32_t pc, const char 
     return write_data(&log, sizeof(log));
 }
 
-/* If log level of a particular tag is set to less than ERROR
- * using esp_log_level_set() then those logs are ignored
+/**
+ * If error logs are enabled via menuconfig, irrespective of if error logs are disabled
+ * using `esp_log_level_set()`, error logs are still reported to Insights cloud
  */
 static esp_err_t esp_diag_log_error(uint32_t pc, const char *tag, const char *format, va_list args)
 {
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
-    if (esp_log_level_get(tag) < ESP_LOG_ERROR) {
-        return ESP_FAIL;
-    }
-#endif
     return diag_log_add(ESP_DIAG_LOG_TYPE_ERROR, pc, tag, format, args);
 }
 
-/* If log level of a particular tag is set to less than WARNING
- * using esp_log_level_set() then those logs are ignored
+/**
+ * If warning logs are enabled via menuconfig, irrespective of if warning logs are disabled
+ * using `esp_log_level_set()`, warning logs are still reported to Insights cloud
  */
 static esp_err_t esp_diag_log_warning(uint32_t pc, const char *tag, const char *format, va_list args)
 {
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
-    if (esp_log_level_get(tag) < ESP_LOG_WARN) {
-        return ESP_FAIL;
-    }
-#endif
     return diag_log_add(ESP_DIAG_LOG_TYPE_WARNING, pc, tag, format, args);
 }
 
-/* If log level of a particular tag is set to less than INFO
- * using esp_log_level_set() then those logs are ignored
+/**
+ * Events are reported irrespective of device logging level.
  */
 esp_err_t esp_diag_log_event(const char *tag, const char *format, ...)
 {
     esp_err_t err;
     va_list args;
     uint32_t pc = esp_cpu_process_stack_pc((uint32_t)__builtin_return_address(0));
-
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
-    if (esp_log_level_get(tag) < ESP_LOG_INFO) {
-        return ESP_FAIL;
-    }
-#endif
-
     va_start(args, format);
     err = diag_log_add(ESP_DIAG_LOG_TYPE_EVENT, pc, tag, format, args);
     va_end(args);
@@ -422,6 +407,26 @@ esp_err_t esp_diag_log_hook_init(esp_diag_log_config_t *config)
     return ESP_OK;
 }
 
+#ifdef CONFIG_LIB_BUILDER_COMPILE
+extern int log_printfv(const char *format, va_list arg);
+
+void __real_log_printf(const char *format, ...);
+
+void __wrap_log_printf(const char *format, ...)
+{
+    va_list list;
+    va_start(list, format);
+    uint32_t pc = 0;
+    pc = esp_cpu_process_stack_pc((uint32_t)__builtin_return_address(0));
+    if (strlen(format) > 7 && format[6] == 'E') {
+        esp_diag_log(ESP_LOG_ERROR, pc, "arduino-esp32", format, list);
+    } else if (strlen(format) > 7 && format[6] == 'W') {
+        esp_diag_log(ESP_LOG_WARN, pc, "arduino-esp32", format, list);
+    }
+    log_printfv(format, list);
+    va_end(list);
+}
+#endif
 /* Wrapping esp_log_write() and esp_log_writev() reduces the
  * changes required in esp_log module to support diagnostics
  */
